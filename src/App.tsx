@@ -19,6 +19,8 @@ interface Signal {
   fundingRate?: number;
   openInterest?: number;
   longShortRatio?: number;
+  dailyRsi?: number;
+  trendDays?: number;
 }
 
 interface Position {
@@ -232,9 +234,15 @@ function SignalCard({ s }: { s: Signal }) {
       <div className="card-metrics">
         <div><span className="ml">Score</span><span className={`mv ${s.score > 0 ? 'up' : s.score < 0 ? 'dn' : ''}`}>{s.score > 0 ? '+' : ''}{s.score}</span></div>
         <div><span className="ml">RSI</span><span className="mv" style={{ color: s.rsi < 35 ? '#00c853' : s.rsi > 65 ? '#ff1744' : '#e6edf3' }}>{s.rsi}</span></div>
+        {s.dailyRsi !== undefined && <div><span className="ml">Daily RSI</span><span className="mv" style={{ color: s.dailyRsi < 40 ? '#00c853' : s.dailyRsi > 70 ? '#ff9100' : '#e6edf3' }}>{s.dailyRsi}</span></div>}
         <div><span className="ml">7d</span><span className={`mv ${s.change7d >= 0 ? 'up' : 'dn'}`}>{fmtPct(s.change7d)}</span></div>
         <div><span className="ml">BB%</span><span className="mv">{s.bbPos.toFixed(2)}</span></div>
       </div>
+
+      {/* Trend persistence */}
+      {s.trendDays !== undefined && s.trendDays > 0 && (
+        <div className="card-trend">🔥 Trend: {s.trendDays}d</div>
+      )}
 
       <div className="card-metrics">
         <div><span className="ml">EMA8</span><span className="mv">{fmtPrice(s.ema8)}</span></div>
@@ -270,7 +278,15 @@ function SignalCard({ s }: { s: Signal }) {
       )}
 
       <div className="card-reasons">
-        {s.reasons.map((r, i) => (<div key={i} className="reason">{r}</div>))}
+        {s.reasons.map((r, i) => {
+          const isBtcWarning = r.startsWith('⚠️ BTC');
+          const isDailyWarning = r.startsWith('⚠️ Daily RSI');
+          const isMultiAlign = r.startsWith('✅ Daily RSI');
+          let cls = 'reason';
+          if (isBtcWarning || isDailyWarning) cls += ' reason-warn';
+          if (isMultiAlign) cls += ' reason-good';
+          return (<div key={i} className={cls}>{r}</div>);
+        })}
       </div>
     </div>
   );

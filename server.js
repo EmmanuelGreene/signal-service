@@ -84,6 +84,9 @@ const COINS = [
   { id: 'render-token',        name: 'Render',        sym: 'RNDR' },
 ];
 
+/* ─── Persistent signal state (trend persistence) ─── */
+const signalState = {}; // coinId -> { direction, score, firstSeen, lastSeen, streak }
+
 /* ─────────────────────────────────────────────
    TECHNICAL INDICATORS
    ───────────────────────────────────────────── */
@@ -134,7 +137,8 @@ function macd(values) {
    ───────────────────────────────────────────── */
 let cachedMarket = null;
 let lastMarketFetch = 0;
-const MARKET_TTL = 10 * 60 * 1000;
+const CG_API_KEY = process.env.CG_API_KEY || null;
+const MARKET_TTL = CG_API_KEY ? 2 * 60 * 1000 : 10 * 60 * 1000;
 
 async function fetchMarketData() {
   const now = Date.now();
@@ -143,10 +147,9 @@ async function fetchMarketData() {
   try {
     const ids = COINS.map(c => c.id).join(',');
     // Main price + 24h + 7d + mcap + volume + sparkline for RSI calc
-    const res = await fetchWithTimeout(
-      `https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&ids=${ids}&order=market_cap_desc&sparkline=true&price_change_percentage=24h,7d`,
-      15000
-    );
+    let url = `https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&ids=${ids}&order=market_cap_desc&sparkline=true&price_change_percentage=24h,7d`;
+    if (CG_API_KEY) url += `&x_cg_pro_api_key=${CG_API_KEY}`;
+    const res = await fetchWithTimeout(url, 15000);
     if (!res.ok) throw new Error(`CoinGecko: ${res.status}`);
     const data = await res.json();
 
@@ -324,7 +327,7 @@ async function fetchBinanceData() {
 /* ─────────────────────────────────────────────
    SIGNAL COMPUTATION
    ───────────────────────────────────────────── */
-function computeSignal(coin, md, binanceData) {
+function computeSignal(coin, md, binanceData, btcChange24h = null) {
   if (!md) return null;
 
   const prices = md.sparkline || [];
@@ -422,6 +425,22 @@ function computeSignal(coin, md, binanceData) {
   if (trendStrength > 15) { score += 1; reasons.push(`+${trendStrength.toFixed(0)}% in 7d`); }
   else if (trendStrength < -12) { score -= 1; reasons.push(`${trendStrength.toFixed(0)}% in 7d`); }
 
+  /* ─── Multi-timeframe confirmation (daily subsample) ─── */
+  const dailyCandles = [];
+  for (let i = 0; i < prices.length; i += 24) {
+    dailyCandles.push(prices[i]);
+  }
+  let dailyRsiVal, dailyEma8Val, emaRatio_daily;
+  if (dailyCandles.length >= 8) {
+    dailyRsiVal = rsi(dailyCandles);
+    dailyEma8Val = ema(dailyCandles, 8);
+    emaRatio_daily = dailyEma8Val / (ema(dailyCandles, 21) || 1);
+  } else {
+    dailyRsiVal = 50;
+    dailyEma8Val = 0;
+    emaRatio_daily = 1;
+  }
+
   /* Derive direction */
   let direction, confidence;
   if (score >= 6) { direction = 'STRONG_BUY'; confidence = Math.min(94, 55 + score * 4); }
@@ -429,6 +448,47 @@ function computeSignal(coin, md, binanceData) {
   else if (score <= -6) { direction = 'STRONG_SELL'; confidence = Math.min(94, 55 + Math.abs(score) * 4); }
   else if (score <= -3) { direction = 'SELL'; confidence = Math.min(85, 50 + Math.abs(score) * 6); }
   else { direction = 'HOLD'; confidence = Math.max(15, Math.min(50, 30 + Math.abs(score) * 5)); }
+
+  /* ─── BTC correlation warning ─── */
+  if (btcChange24h !== null && coin.id !== 'bitcoin' && btcChange24h < -3 && (direction === 'BUY' || direction === 'STRONG_BUY')) {
+    score -= 1;
+    reasons.push(`⚠️ BTC dumping ${btcChange24h.toFixed(1)}% — alt buy risky`);
+  }
+
+  /* ─── Daily TF adjustments ─── */
+  if (dailyRsiVal > 75 && (direction === 'BUY' || direction === 'STRONG_BUY')) {
+    reasons.push(`⚠️ Daily RSI ${dailyRsiVal.toFixed(0)} — macro overbought, tempered`);
+  }
+  if (score >= 6 && emaRatio_daily < 1) {
+    score -= 1;
+  }
+  if (dailyRsiVal < 70 && direction === 'STRONG_BUY') {
+    reasons.push(`✅ Daily RSI healthy — multi-TF aligned`);
+  }
+
+  /* ─── Re-derive direction after score adjustments ─── */
+  if (score >= 6) { direction = 'STRONG_BUY'; confidence = Math.min(94, 55 + score * 4); }
+  else if (score >= 3) { direction = 'BUY'; confidence = Math.min(85, 50 + score * 6); }
+  else if (score <= -6) { direction = 'STRONG_SELL'; confidence = Math.min(94, 55 + Math.abs(score) * 4); }
+  else if (score <= -3) { direction = 'SELL'; confidence = Math.min(85, 50 + Math.abs(score) * 6); }
+  else { direction = 'HOLD'; confidence = Math.max(15, Math.min(50, 30 + Math.abs(score) * 5)); }
+
+  /* ─── Persistent signal state ─── */
+  if (!signalState[coin.id]) {
+    signalState[coin.id] = { direction: null, score: 0, firstSeen: Date.now(), lastSeen: Date.now(), streak: 0 };
+  }
+  if (signalState[coin.id].direction === direction) {
+    signalState[coin.id].streak++;
+  } else {
+    signalState[coin.id].direction = direction;
+    signalState[coin.id].streak = 1;
+    signalState[coin.id].firstSeen = Date.now();
+  }
+  signalState[coin.id].lastSeen = Date.now();
+  signalState[coin.id].score = score;
+  const trendDays = Math.round((signalState[coin.id].streak * 3) / 24);
+
+  const dailyTrend = emaRatio_daily >= 1.008 ? 'bullish' : emaRatio_daily <= 0.992 ? 'bearish' : 'neutral';
 
   return {
     coinId: coin.id,
@@ -467,6 +527,10 @@ function computeSignal(coin, md, binanceData) {
         ? Math.round(price * 0.88 * 100) / 100  // 12% below (for short)
         : null,
     timestamp: new Date().toISOString(),
+    // Multi-timeframe data
+    dailyRsi: Math.round(dailyRsiVal * 10) / 10,
+    dailyTrend,
+    trendDays,
     // Binance derivatives data (when available)
     fundingRate: binanceData?.[coin.id]?.fundingRate ?? null,
     openInterest: binanceData?.[coin.id]?.openInterest ?? null,
@@ -560,6 +624,8 @@ class PaperTrader {
     this.tpPct = 0.12;   // 12% take-profit
     this.trailingActivationPct = 0.03; // activate trailing at 3% profit
     this.trailPct = 0.03;              // trail 3% below peak
+    this.scaleInEnabled = true;
+    this.scaleInThreshold = 0.02;       // 2% dip for second entry
     this.priceCache = {}; // coinId -> { price, fetchedAt }
     this.pricePollInterval = null;
     this.confidenceHits = {}; // confRange -> { hits, total }
@@ -624,6 +690,10 @@ class PaperTrader {
         const trigger = this.checkSLTP(coinId, entry.usd);
         if (trigger) {
           this.closePosition(coinId, entry.usd, trigger);
+        }
+        // Try scale-in for positions flagged for scaling
+        if (pos && pos.scaledIn && !pos.scaleInFilled) {
+          this.tryScaleIn(coinId, entry.usd);
         }
       }
     } catch (_) { /* silent — CG rate limits */ }
@@ -703,7 +773,8 @@ class PaperTrader {
     for (const s of buySignals) {
       if (entered >= slots) break;
       if (this.positions[s.coinId]) continue;
-      this.openPosition(s.coinId, 'LONG', s.price, `Signal: ${s.description || 'BUY signal'}`, s.confidence);
+      const useScaleIn = s.score >= 6;
+      this.openPosition(s.coinId, 'LONG', s.price, `Signal: ${s.description || 'BUY signal'}`, s.confidence, useScaleIn);
       entered++;
     }
     for (const s of sellSignals) {
@@ -716,8 +787,9 @@ class PaperTrader {
     if (openCount === 0 && entered > 0) this.startPricePolling();
   }
 
-  openPosition(coinId, direction, price, reason, confidence) {
-    const alloc = this.balance * this.maxPerPosition;
+  openPosition(coinId, direction, price, reason, confidence, scaleIn = false) {
+    const fullAlloc = this.balance * this.maxPerPosition;
+    const alloc = scaleIn ? fullAlloc * 0.5 : fullAlloc;
     const size = alloc / price;
     const slPrice = direction === 'LONG' ? price * (1 - this.slPct) : price * (1 + this.slPct);
     const tpPrice = direction === 'LONG' ? price * (1 + this.tpPct) : price * (1 - this.tpPct);
@@ -726,8 +798,24 @@ class PaperTrader {
       confidence: confidence || 50,
       slPrice, tpPrice, pnl: 0, pnlPct: 0,
       trailingStopPrice: null, peakPrice: price,
+      scaledIn: scaleIn, scaleInFilled: false, scaleEntryPrice: null,
     };
     this.balance -= alloc * (direction === 'LONG' ? 1 : 0);
+  }
+
+  tryScaleIn(coinId, currentPrice) {
+    const pos = this.positions[coinId];
+    if (!pos || !pos.scaledIn || pos.scaleInFilled) return;
+    const dipPct = (pos.entryPrice - currentPrice) / pos.entryPrice;
+    if (dipPct >= this.scaleInThreshold) {
+      const sideAlloc = this.balance * this.maxPerPosition * 0.5;
+      const extraSize = sideAlloc / currentPrice;
+      pos.size += extraSize;
+      pos.scaleEntryPrice = currentPrice;
+      pos.scaleInFilled = true;
+      this.balance -= sideAlloc * (pos.direction === 'LONG' ? 1 : 0);
+      console.log(`📈 Scale-in for ${coinId}: added at $${currentPrice.toFixed(2)} (dip ${(dipPct * 100).toFixed(1)}%)`);
+    }
   }
 
   closePosition(coinId, exitPrice, reason = 'SIGNAL_REVERSAL') {
@@ -1136,6 +1224,7 @@ app.get('/api/health', (req, res) => {
     uptimeSeconds: uptime,
     started: new Date(START_TIME).toISOString(),
     coins: COINS.length,
+    hasApiKey: !!CG_API_KEY,
     cacheAge: lastMarketFetch > 0 ? Math.round((Date.now() - lastMarketFetch) / 1000) + 's' : 'none',
     cacheFresh: (Date.now() - lastMarketFetch) < MARKET_TTL,
     memory: process.memoryUsage().rss > 1e9
@@ -1158,7 +1247,14 @@ app.get('/api/signals', async (req, res) => {
     // Fetch Binance derivatives data in parallel
     const binanceData = await fetchBinanceData();
 
-    let signals = COINS.map(coin => computeSignal(coin, marketData[coin.id], binanceData)).filter(Boolean);
+    // Compute BTC signal first to get its change24h for correlation
+    let btcChange24h = null;
+    const btcMd = marketData['bitcoin'];
+    if (btcMd) {
+      btcChange24h = btcMd.change24h;
+    }
+
+    let signals = COINS.map(coin => computeSignal(coin, marketData[coin.id], binanceData, btcChange24h)).filter(Boolean);
 
     // Process paper trading FIRST — so it sees the raw signals
     trader.process(signals);

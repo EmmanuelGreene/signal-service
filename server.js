@@ -496,8 +496,15 @@ function getCoinReliability(coinId) {
 /* ─────────────────────────────────────────────
    CONVICTION FIREWALL — only surface what we can trust
    ───────────────────────────────────────────── */
-function applyConvictionFirewall(signals) {
+function applyConvictionFirewall(signals, heldCoins = []) {
   for (const s of signals) {
+    // Skip coins we're currently holding — don't downgrade our own positions
+    if (heldCoins.includes(s.coinId)) {
+      // Keep the signal as-is but cap confidence display
+      s.confidence = Math.min(98, Math.max(10, s.confidence));
+      continue;
+    }
+
     // Risk filters
     const rejectReasons = [];
 
@@ -673,14 +680,14 @@ class PaperTrader {
       }
     }
 
-    // Exit positions that contradict new signal
+    // Exit positions ONLY on actual opposing signals — NOT on HOLD (score dip)
     for (const coinId of Object.keys(this.positions)) {
       const pos = this.positions[coinId];
       const sig = signals.find(s => s.coinId === coinId);
       if (!sig) continue;
 
-      const shouldExit = (pos.direction === 'LONG' && (sig.direction === 'SELL' || sig.direction === 'STRONG_SELL'))
-                      || (pos.direction === 'SHORT' && (sig.direction === 'BUY' || sig.direction === 'STRONG_BUY'));
+      const shouldExit = (pos.direction === 'LONG' && sig.direction === 'STRONG_SELL')
+                      || (pos.direction === 'SHORT' && sig.direction === 'STRONG_BUY');
 
       if (shouldExit) {
         this.closePosition(coinId, sig.price, 'SIGNAL_REVERSAL');
@@ -1152,10 +1159,13 @@ app.get('/api/signals', async (req, res) => {
     const binanceData = await fetchBinanceData();
 
     let signals = COINS.map(coin => computeSignal(coin, marketData[coin.id], binanceData)).filter(Boolean);
-    signals = applyConvictionFirewall(signals);
 
-    // Process paper trading
+    // Process paper trading FIRST — so it sees the raw signals
     trader.process(signals);
+
+    // Then apply conviction firewall, but don't downgrade held positions
+    const heldCoins = Object.keys(trader.positions);
+    signals = applyConvictionFirewall(signals, heldCoins);
 
     const overview = marketOverview(signals);
     const portfolio = trader.getStatus(signals);
@@ -1205,7 +1215,8 @@ app.get('/api/conviction', async (req, res) => {
     if (!marketData) return res.status(503).json({ success: false, error: 'Data unavailable' });
 
     let signals = COINS.map(coin => computeSignal(coin, marketData[coin.id])).filter(Boolean);
-    signals = applyConvictionFirewall(signals);
+    const heldCoins = Object.keys(trader.positions);
+    signals = applyConvictionFirewall(signals, heldCoins);
 
     const topSignals = signals
       .filter(s => s.direction === 'STRONG_BUY' || s.direction === 'STRONG_SELL')

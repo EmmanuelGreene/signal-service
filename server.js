@@ -172,6 +172,151 @@ async function fetchMarketData() {
     return map;
   } catch (e) {
     console.log(`⚠️ CoinGecko: ${e.message}`);
+    console.log('🔄 Falling back to CoinCap...');
+    const fallback = await fetchMarketDataFallback();
+    if (fallback) {
+      cachedMarket = fallback;
+      lastMarketFetch = now;
+      console.log(`📡 CoinCap fallback: ${Object.keys(fallback).length} coins`);
+    }
+    return fallback;
+  }
+}
+
+/* ─────────────────────────────────────────────
+   COINCAP FALLBACK — when CoinGecko is down
+   ───────────────────────────────────────────── */
+const COINCAP_ID_MAP = {
+  'BTC': 'bitcoin', 'ETH': 'ethereum', 'SOL': 'solana', 'XRP': 'ripple',
+  'ADA': 'cardano', 'DOGE': 'dogecoin', 'DOT': 'polkadot', 'AVAX': 'avalanche-2',
+  'LINK': 'chainlink', 'NEAR': 'near', 'SUI': 'sui', 'ATOM': 'cosmos',
+  'XLM': 'stellar', 'HBAR': 'hedera-hashgraph', 'ARB': 'arbitrum', 'LTC': 'litecoin',
+  'TON': 'the-open-network', 'RNDR': 'render-token',
+};
+const COINCAP_API_BASE = 'https://api.coincap.io/v2/assets';
+
+async function fetchMarketDataFallback() {
+  try {
+    const results = {};
+    let fetchedCount = 0;
+    for (const coin of COINS) {
+      const slug = COINCAP_ID_MAP[coin.sym];
+      if (!slug) continue;
+      const res = await fetchWithTimeout(`${COINCAP_API_BASE}/${slug}`, 8000);
+      if (!res.ok) continue;
+      const body = await res.json();
+      const d = body?.data;
+      if (!d) continue;
+      const price = parseFloat(d.priceUsd);
+      results[coin.id] = {
+        price,
+        mcap: parseFloat(d.marketCapUsd) || 0,
+        vol24h: parseFloat(d.volumeUsd24Hr) || 0,
+        change24h: parseFloat(d.changePercent24Hr) || 0,
+        change7d: 0,
+        high24h: price,  // CoinCap doesn't provide 24h high/low
+        low24h: price,
+        sparkline: [price],
+        ath: price,
+      };
+      fetchedCount++;
+      // Small delay to be polite to CoinCap
+      if (fetchedCount % 6 === 0) await new Promise(r => setTimeout(r, 300));
+    }
+    return Object.keys(results).length > 0 ? results : null;
+  } catch (e) {
+    console.log(`⚠️ CoinCap fallback error: ${e.message}`);
+    return null;
+  }
+}
+
+/* ─────────────────────────────────────────────
+   BINANCE FETCHER — funding rates & volume profile
+   ───────────────────────────────────────────── */
+let cachedBinance = null;
+let lastBinanceFetch = 0;
+const BINANCE_TTL = 5 * 60 * 1000; // 5 min
+
+const BINANCE_SYMBOLS = {
+  'bitcoin': 'BTCUSDT', 'ethereum': 'ETHUSDT', 'solana': 'SOLUSDT',
+  'ripple': 'XRPUSDT', 'cardano': 'ADAUSDT', 'dogecoin': 'DOGEUSDT',
+  'polkadot': 'DOTUSDT', 'avalanche-2': 'AVAXUSDT', 'chainlink': 'LINKUSDT',
+  'near': 'NEARUSDT', 'sui': 'SUIUSDT', 'cosmos': 'ATOMUSDT',
+  'stellar': 'XLMUSDT', 'hedera-hashgraph': 'HBARUSDT', 'arbitrum': 'ARBUSDT',
+  'litecoin': 'LTCUSDT', 'the-open-network': 'TONUSDT', 'render-token': 'RNDRUSDT',
+};
+
+async function fetchBinanceData() {
+  const now = Date.now();
+  if (cachedBinance && (now - lastBinanceFetch) < BINANCE_TTL) return cachedBinance;
+
+  try {
+    const results = {};
+    const symbols = Object.values(BINANCE_SYMBOLS);
+    const batchSize = 10;
+    for (let i = 0; i < symbols.length; i += batchSize) {
+      const batch = symbols.slice(i, i + batchSize);
+      const entries = await Promise.allSettled(batch.map(async (sym) => {
+        // Funding rate
+        const frRes = await fetchWithTimeout(
+          `https://fapi.binance.com/fapi/v1/fundingRate?symbol=${sym}&limit=1`, 6000
+        );
+        let fundingRate = 0;
+        if (frRes.ok) {
+          const frData = await frRes.json();
+          if (frData?.length > 0) fundingRate = parseFloat(frData[0].fundingRate) || 0;
+        }
+
+        // Open interest
+        let openInterest = 0;
+        const oiRes = await fetchWithTimeout(
+          `https://fapi.binance.com/fapi/v1/openInterest?symbol=${sym}`, 6000
+        );
+        if (oiRes.ok) {
+          const oiData = await oiRes.json();
+          openInterest = parseFloat(oiData.openInterest) || 0;
+        }
+
+        // Long/short ratio (top trader positions)
+        let longShortRatio = 0.5;
+        const lsRes = await fetchWithTimeout(
+          `https://fapi.binance.com/futures/data/globalLongShortAccountRatio?symbol=${sym}&period=5m&limit=1`, 6000
+        );
+        if (lsRes.ok) {
+          const lsData = await lsRes.json();
+          if (lsData?.length > 0) {
+            longShortRatio = parseFloat(lsData[0].longShortRatio) || 0.5;
+          }
+        }
+
+        return { sym, fundingRate, openInterest, longShortRatio };
+      }));
+
+      for (const entry of entries) {
+        if (entry.status === 'fulfilled' && entry.value) {
+          results[entry.value.sym] = {
+            fundingRate: entry.value.fundingRate,
+            openInterest: entry.value.openInterest,
+            longShortRatio: entry.value.longShortRatio,
+          };
+        }
+      }
+      // Polite delay between batches
+      if (i + batchSize < symbols.length) await new Promise(r => setTimeout(r, 500));
+    }
+
+    // Map back to coin IDs
+    const mapped = {};
+    for (const [coinId, sym] of Object.entries(BINANCE_SYMBOLS)) {
+      if (results[sym]) mapped[coinId] = results[sym];
+    }
+
+    cachedBinance = mapped;
+    lastBinanceFetch = now;
+    console.log(`📡 Binance: ${Object.keys(mapped).length} coins`);
+    return mapped;
+  } catch (e) {
+    console.log(`⚠️ Binance: ${e.message}`);
     return null;
   }
 }
@@ -179,7 +324,7 @@ async function fetchMarketData() {
 /* ─────────────────────────────────────────────
    SIGNAL COMPUTATION
    ───────────────────────────────────────────── */
-function computeSignal(coin, md) {
+function computeSignal(coin, md, binanceData) {
   if (!md) return null;
 
   const prices = md.sparkline || [];
@@ -322,6 +467,10 @@ function computeSignal(coin, md) {
         ? Math.round(price * 0.88 * 100) / 100  // 12% below (for short)
         : null,
     timestamp: new Date().toISOString(),
+    // Binance derivatives data (when available)
+    fundingRate: binanceData?.[coin.id]?.fundingRate ?? null,
+    openInterest: binanceData?.[coin.id]?.openInterest ?? null,
+    longShortRatio: binanceData?.[coin.id]?.longShortRatio ?? null,
   };
 }
 
@@ -402,6 +551,8 @@ class PaperTrader {
     this.maxPerPosition = 0.20;
     this.slPct = 0.05;   // 5% stop-loss
     this.tpPct = 0.12;   // 12% take-profit
+    this.trailingActivationPct = 0.03; // activate trailing at 3% profit
+    this.trailPct = 0.03;              // trail 3% below peak
     this.priceCache = {}; // coinId -> { price, fetchedAt }
     this.pricePollInterval = null;
     this.confidenceHits = {}; // confRange -> { hits, total }
@@ -413,6 +564,28 @@ class PaperTrader {
     const unrealized = pos.direction === 'LONG'
       ? (currentPrice - pos.entryPrice) / pos.entryPrice
       : (pos.entryPrice - currentPrice) / pos.entryPrice;
+
+    // Track peak price for trailing stop
+    if (pos.direction === 'LONG' && currentPrice > pos.peakPrice) {
+      pos.peakPrice = currentPrice;
+    } else if (pos.direction === 'SHORT' && currentPrice < pos.peakPrice) {
+      pos.peakPrice = currentPrice;
+    }
+
+    // Trailing stop: activate at 3% profit, trail 3% below peak
+    if (unrealized >= this.trailingActivationPct) {
+      const trailStop = pos.direction === 'LONG'
+        ? pos.peakPrice * (1 - this.trailPct)
+        : pos.peakPrice * (1 + this.trailPct);
+      if (pos.direction === 'LONG' && trailStop > (pos.trailingStopPrice ?? 0)) {
+        pos.trailingStopPrice = trailStop;
+      } else if (pos.direction === 'SHORT' && (pos.trailingStopPrice === null || trailStop < pos.trailingStopPrice)) {
+        pos.trailingStopPrice = trailStop;
+      }
+      // Check trailing stop hit
+      if (pos.direction === 'LONG' && currentPrice <= pos.trailingStopPrice) return 'TRAILING_STOP';
+      if (pos.direction === 'SHORT' && currentPrice >= pos.trailingStopPrice) return 'TRAILING_STOP';
+    }
 
     if (unrealized <= -this.slPct) return 'STOP_LOSS';
     if (unrealized >= this.tpPct) return 'TAKE_PROFIT';
@@ -432,6 +605,15 @@ class PaperTrader {
       const now = Date.now();
       for (const [coinId, entry] of Object.entries(data)) {
         this.priceCache[coinId] = { price: entry.usd, fetchedAt: now };
+        // Update peak price for trailing stop
+        const pos = this.positions[coinId];
+        if (pos) {
+          if (pos.direction === 'LONG' && entry.usd > pos.peakPrice) {
+            pos.peakPrice = entry.usd;
+          } else if (pos.direction === 'SHORT' && entry.usd < pos.peakPrice) {
+            pos.peakPrice = entry.usd;
+          }
+        }
         const trigger = this.checkSLTP(coinId, entry.usd);
         if (trigger) {
           this.closePosition(coinId, entry.usd, trigger);
@@ -536,6 +718,7 @@ class PaperTrader {
       direction, entryPrice: price, size, entryAt: Date.now(), reason,
       confidence: confidence || 50,
       slPrice, tpPrice, pnl: 0, pnlPct: 0,
+      trailingStopPrice: null, peakPrice: price,
     };
     this.balance -= alloc * (direction === 'LONG' ? 1 : 0);
   }
@@ -965,7 +1148,10 @@ app.get('/api/signals', async (req, res) => {
       return res.json({ success: false, error: 'Could not fetch market data', dataSource: 'error' });
     }
 
-    let signals = COINS.map(coin => computeSignal(coin, marketData[coin.id])).filter(Boolean);
+    // Fetch Binance derivatives data in parallel
+    const binanceData = await fetchBinanceData();
+
+    let signals = COINS.map(coin => computeSignal(coin, marketData[coin.id], binanceData)).filter(Boolean);
     signals = applyConvictionFirewall(signals);
 
     // Process paper trading
@@ -986,7 +1172,7 @@ app.get('/api/signals', async (req, res) => {
       signals,
       overview,
       portfolio,
-      dataSource: 'coingecko-live',
+      dataSource: binanceData ? 'coingecko-live+binance' : 'coingecko-live',
     });
   } catch (e) {
     console.error('Signals error:', e.message);

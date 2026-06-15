@@ -16,6 +16,9 @@ interface Signal {
   takeProfit: number | null;
   reasons: string[]; description: string;
   timestamp: string;
+  fundingRate?: number;
+  openInterest?: number;
+  longShortRatio?: number;
 }
 
 interface Position {
@@ -152,6 +155,46 @@ function BacktestPanel({ data }: { data: BacktestResult | null }) {
 
 /* ─── Signal Card ─── */
 function SignalCard({ s }: { s: Signal }) {
+  const [showChart, setShowChart] = useState(false);
+  const chartRef = useRef<HTMLDivElement>(null);
+  const tvInited = useRef(false);
+
+  // TradingView symbol mapping
+  const tvSymbol = s.symbol === 'RNDR' ? 'RENDER' : s.symbol === 'TON' ? 'TONCOIN' : s.symbol === 'BTC' ? 'BTC' : s.symbol;
+
+  useEffect(() => {
+    if (!showChart || !chartRef.current || tvInited.current) return;
+    tvInited.current = true;
+    const script = document.createElement('script');
+    script.src = 'https://s3.tradingview.com/tv.js';
+    script.async = true;
+    script.onload = () => {
+      if (typeof TradingView !== 'undefined' && chartRef.current) {
+        new TradingView.widget({
+          container_id: chartRef.current.id,
+          width: '100%',
+          height: 260,
+          symbol: `BINANCE:${tvSymbol}USDT`,
+          interval: '60',
+          timezone: 'Etc/UTC',
+          theme: 'dark',
+          style: '1',
+          locale: 'en',
+          toolbar_bg: '#0d1117',
+          enable_publishing: false,
+          hide_side_toolbar: false,
+          allow_symbol_change: false,
+          studies: ['RSI@tv-basicstudies', 'MACD@tv-basicstudies'],
+          disabled_features: ['header_symbol_search', 'symbol_search_hot_key'],
+          backgroundColor: '#0d1117',
+          gridColor: '#21262d',
+        });
+      }
+    };
+    document.head.appendChild(script);
+    return () => { /* keep widget mounted */ };
+  }, [showChart, tvSymbol]);
+
   return (
     <div className="card" style={{ borderLeftColor: dirColor(s.direction) }}>
       <div className="card-top">
@@ -199,6 +242,32 @@ function SignalCard({ s }: { s: Signal }) {
         <div><span className="ml">MACD</span><span className={`mv ${s.macd > 0 ? 'up' : 'dn'}`}>{s.macd.toFixed(1)}</span></div>
         <div><span className="ml">Vol/MCap</span><span className="mv">{s.volRatio.toFixed(1)}%</span></div>
       </div>
+
+      {/* Funding rate from Binance futures */}
+      {s.fundingRate !== undefined && (
+        <div className="card-funding">
+          <span className="ml">Funding</span>
+          <span className={`mv ${s.fundingRate > 0 ? 'up' : 'dn'}`}>{(s.fundingRate * 100).toFixed(4)}%</span>
+          {s.longShortRatio !== undefined && (
+            <span className="ml" style={{ marginLeft: 12 }}>L/S</span>
+          )}
+          {s.longShortRatio !== undefined && (
+            <span className="mv">{s.longShortRatio.toFixed(2)}x</span>
+          )}
+        </div>
+      )}
+
+      {/* TradingView chart toggle */}
+      <button className="chart-toggle" onClick={() => setShowChart(!showChart)}>
+        {showChart ? '▲ Hide Chart' : '▼ Show Chart'}
+      </button>
+      {showChart && (
+        <div
+          id={`tv-${s.coinId}`}
+          ref={chartRef}
+          className="tv-chart-container"
+        />
+      )}
 
       <div className="card-reasons">
         {s.reasons.map((r, i) => (<div key={i} className="reason">{r}</div>))}

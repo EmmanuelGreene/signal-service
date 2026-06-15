@@ -325,6 +325,22 @@ function applyRelativeRanking(signals) {
       s.confidence = Math.round(Math.min(95, s.confidence + 12));
     }
     s.confidence = Math.min(98, Math.max(10, s.confidence));
+
+    // Update entry/stop/target if relative ranking changed direction
+    const p = s.price;
+    if (s.direction === 'BUY' || s.direction === 'STRONG_BUY') {
+      s.entryPrice = Math.round(p * 0.998 * 100) / 100;
+      s.stopLoss = Math.round(p * 0.95 * 100) / 100;
+      s.takeProfit = Math.round(p * 1.12 * 100) / 100;
+    } else if (s.direction === 'SELL' || s.direction === 'STRONG_SELL') {
+      s.entryPrice = Math.round(p * 1.002 * 100) / 100;
+      s.stopLoss = Math.round(p * 1.05 * 100) / 100;
+      s.takeProfit = Math.round(p * 0.88 * 100) / 100;
+    } else {
+      s.entryPrice = null;
+      s.stopLoss = null;
+      s.takeProfit = null;
+    }
   }
 
   return signals;

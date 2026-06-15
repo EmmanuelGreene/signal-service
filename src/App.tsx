@@ -207,6 +207,66 @@ function SignalCard({ s }: { s: Signal }) {
   );
 }
 
+/* ─── Top Picks ─── */
+function TopPicks({ signals, backtest }: { signals: Signal[], backtest: BacktestResult | null }) {
+  const buys = signals.filter(s => s.direction === 'STRONG_BUY' || s.direction === 'BUY').sort((a, b) => b.confidence - a.confidence).slice(0, 2);
+  const sells = signals.filter(s => s.direction === 'STRONG_SELL' || s.direction === 'SELL').sort((a, b) => b.confidence - a.confidence).slice(0, 1);
+
+  if (buys.length === 0 && sells.length === 0) return null;
+
+  // Find backtest result for best coin
+  const btForCoin = (sym: string) => backtest?.coins?.find(c => c.symbol === sym);
+
+  return (
+    <div className="top-picks">
+      <div className="tp-title">🎯 Top Picks — Highest Conviction</div>
+      <div className="tp-row">
+        {buys.map(s => {
+          const bt = btForCoin(s.symbol);
+          return (
+            <div key={s.coinId} className="tp-card tp-buy">
+              <div className="tp-header">
+                <span className="tp-dir up">{dirLabel(s.direction)}</span>
+                <span className="tp-sym">{s.symbol}</span>
+                <span className="tp-conf">{s.confidence}% confidence</span>
+              </div>
+              <div className="tp-price">{fmtPrice(s.price)}</div>
+              <div className="tp-levels">
+                <span>Entry <b>{fmtPrice(s.entryPrice!)}</b></span>
+                <span className="dn">Stop <b>{fmtPrice(s.stopLoss!)}</b></span>
+                <span className="up">Target <b>{fmtPrice(s.takeProfit!)}</b></span>
+              </div>
+              <div className="tp-reason">{s.description}</div>
+              {bt && bt.buys > 0 && <div className="tp-bt">📊 Backtest: {bt.buyWinRate}% WR · {bt.avgBuyPnl >= 0 ? '+' : ''}{bt.avgBuyPnl}% avg</div>}
+            </div>
+          );
+        })}
+        {sells.map(s => {
+          const bt = btForCoin(s.symbol);
+          return (
+            <div key={s.coinId} className="tp-card tp-sell">
+              <div className="tp-header">
+                <span className="tp-dir dn">{dirLabel(s.direction)}</span>
+                <span className="tp-sym">{s.symbol}</span>
+                <span className="tp-conf">{s.confidence}% confidence</span>
+              </div>
+              <div className="tp-price">{fmtPrice(s.price)}</div>
+              <div className="tp-levels">
+                <span>Entry <b>{fmtPrice(s.entryPrice!)}</b></span>
+                <span className="dn">Stop <b>{fmtPrice(s.stopLoss!)}</b></span>
+                <span className="up">Target <b>{fmtPrice(s.takeProfit!)}</b></span>
+              </div>
+              <div className="tp-reason">{s.description}</div>
+              {bt && bt.sells > 0 && <div className="tp-bt">📊 Backtest: {bt.sellWinRate}% WR · {bt.avgSellPnl >= 0 ? '+' : ''}{bt.avgSellPnl}% avg</div>}
+            </div>
+          );
+        })}
+      </div>
+      <div className="tp-rule">⚠️ SL 5% · TP 12% · Risk only what you can lose</div>
+    </div>
+  );
+}
+
 /* ─── Main App ─── */
 function App() {
   const [signals, setSignals] = useState<Signal[]>([]);
@@ -321,6 +381,9 @@ function App() {
         {/* BACKTEST PANEL */}
         <BacktestPanel data={backtest} />
         {btLoading && !backtest && <div className="loading"><div className="spinner" /> Running backtest...</div>}
+
+        {/* TOP PICKS */}
+        {!loading && signals.length > 0 && <TopPicks signals={signals} backtest={backtest} />}
 
         {/* TABS */}
         <div className="tabs">

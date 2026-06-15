@@ -80,6 +80,29 @@ body {
 .bt-pnl.dn { color: var(--red2); }
 .bt-detail { color: var(--text3); font-size: 9px; }
 
+/* ─── Top Picks ─── */
+.top-picks { margin-bottom: 12px; }
+.tp-title { font-size: 14px; font-weight: 700; margin-bottom: 8px; color: var(--text); }
+.tp-row { display: flex; gap: 10px; flex-wrap: wrap; }
+.tp-card { flex: 1; min-width: 280px; max-width: 100%; padding: 12px 14px; border-radius: 8px; border: 1px solid var(--border); }
+.tp-buy { background: linear-gradient(135deg, rgba(0,200,83,.06), var(--card)); border-left: 4px solid var(--green); }
+.tp-sell { background: linear-gradient(135deg, rgba(255,23,68,.06), var(--card)); border-left: 4px solid var(--red); }
+.tp-header { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.tp-dir { font-size: 11px; font-weight: 700; padding: 2px 7px; border-radius: 3px; }
+.tp-dir.up { background: rgba(0,200,83,.15); color: var(--green); }
+.tp-dir.dn { background: rgba(255,23,68,.15); color: var(--red); }
+.tp-sym { font-size: 16px; font-weight: 700; }
+.tp-conf { font-size: 11px; color: var(--text3); margin-left: auto; }
+.tp-price { font-size: 22px; font-weight: 700; margin-bottom: 6px; }
+.tp-levels { display: flex; gap: 16px; font-size: 11px; color: var(--text3); margin-bottom: 6px; padding: 6px 8px; background: var(--surface); border-radius: 5px; }
+.tp-levels span { display: flex; gap: 4px; align-items: center; }
+.tp-levels b { font-size: 12px; color: var(--text); }
+.tp-levels .dn b { color: var(--red2); }
+.tp-levels .up b { color: var(--green2); }
+.tp-reason { font-size: 11px; color: var(--text2); margin-bottom: 4px; line-height: 1.4; }
+.tp-bt { font-size: 10px; color: var(--blue); }
+.tp-rule { font-size: 10px; color: var(--text3); margin-top: 6px; text-align: center; opacity: .7; }
+
 /* ─── Tabs ─── */
 .tabs { display: flex; gap: 5px; margin-bottom: 8px; flex-wrap: wrap; }
 .tab { padding: 4px 12px; border: 1px solid var(--border); border-radius: 16px; background: transparent; color: var(--text3); cursor: pointer; font-size: 11px; font-weight: 500; transition: all .12s; }

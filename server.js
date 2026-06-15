@@ -317,18 +317,106 @@ function applyRelativeRanking(signals) {
 /* ─────────────────────────────────────────────
    PAPER TRADING ENGINE
    ───────────────────────────────────────────── */
+/* ─────────────────────────────────────────────
+   PAPER TRADING ENGINE (with SL/TP)
+   ───────────────────────────────────────────── */
 class PaperTrader {
   constructor() {
-    this.positions = {};   // coinId -> {entryPrice, size, direction, entryAt, reason}
-    this.trades = [];      // closed trades
+    this.positions = {};
+    this.trades = [];
     this.startBalance = 10000;
     this.balance = 10000;
-    this.maxPerPosition = 0.20; // 20% per position
+    this.maxPerPosition = 0.20;
+    this.slPct = 0.05;   // 5% stop-loss
+    this.tpPct = 0.12;   // 12% take-profit
+    this.priceCache = {}; // coinId -> { price, fetchedAt }
+    this.pricePollInterval = null;
+    this.confidenceHits = {}; // confRange -> { hits, total }
+  }
+
+  checkSLTP(coinId, currentPrice) {
+    const pos = this.positions[coinId];
+    if (!pos) return null;
+    const unrealized = pos.direction === 'LONG'
+      ? (currentPrice - pos.entryPrice) / pos.entryPrice
+      : (pos.entryPrice - currentPrice) / pos.entryPrice;
+
+    if (unrealized <= -this.slPct) return 'STOP_LOSS';
+    if (unrealized >= this.tpPct) return 'TAKE_PROFIT';
+    return null;
+  }
+
+  async pollPrices() {
+    try {
+      const ids = Object.keys(this.positions).join(',');
+      if (!ids) return;
+      const res = await fetch(
+        `https://api.coingecko.com/api/v3/simple/price?ids=${ids}&vs_currencies=usd`,
+        { signal: AbortSignal.timeout(8000) }
+      );
+      if (!res.ok) return;
+      const data = await res.json();
+      const now = Date.now();
+      for (const [coinId, entry] of Object.entries(data)) {
+        this.priceCache[coinId] = { price: entry.usd, fetchedAt: now };
+        const trigger = this.checkSLTP(coinId, entry.usd);
+        if (trigger) {
+          this.closePosition(coinId, entry.usd, trigger);
+        }
+      }
+    } catch (_) { /* silent — CG rate limits */ }
+  }
+
+  startPricePolling() {
+    if (this.pricePollInterval) return;
+    this.pricePollInterval = setInterval(() => this.pollPrices(), 60_000);
+  }
+
+  stopPricePolling() {
+    if (this.pricePollInterval) {
+      clearInterval(this.pricePollInterval);
+      this.pricePollInterval = null;
+    }
+  }
+
+  recordConfidenceCalibration(confidence, wasCorrect) {
+    const bucket = confidence >= 90 ? '90-100'
+      : confidence >= 80 ? '80-89'
+      : confidence >= 70 ? '70-79'
+      : confidence >= 60 ? '60-69'
+      : confidence >= 50 ? '50-59'
+      : '0-49';
+    if (!this.confidenceHits[bucket]) this.confidenceHits[bucket] = { hits: 0, total: 0 };
+    this.confidenceHits[bucket].total++;
+    if (wasCorrect) this.confidenceHits[bucket].hits++;
+  }
+
+  getConfidenceCalibration() {
+    const result = {};
+    for (const [bucket, data] of Object.entries(this.confidenceHits)) {
+      result[bucket] = {
+        hits: data.hits,
+        total: data.total,
+        accuracy: data.total > 0 ? Math.round((data.hits / data.total) * 100) : 0,
+      };
+    }
+    return result;
   }
 
   process(signals) {
     const buySignals = signals.filter(s => s.direction === 'BUY' || s.direction === 'STRONG_BUY').sort((a,b) => b.confidence - a.confidence);
     const sellSignals = signals.filter(s => s.direction === 'SELL' || s.direction === 'STRONG_SELL').sort((a,b) => b.confidence - a.confidence);
+
+    // Check SL/TP via cached CG prices first (fresher than signal prices)
+    for (const coinId of Object.keys(this.positions)) {
+      const cached = this.priceCache[coinId];
+      if (cached && (Date.now() - cached.fetchedAt) < 120_000) {
+        const trigger = this.checkSLTP(coinId, cached.price);
+        if (trigger) {
+          this.closePosition(coinId, cached.price, trigger);
+        }
+      }
+    }
 
     // Exit positions that contradict new signal
     for (const coinId of Object.keys(this.positions)) {
@@ -340,11 +428,11 @@ class PaperTrader {
                       || (pos.direction === 'SHORT' && (sig.direction === 'BUY' || sig.direction === 'STRONG_BUY'));
 
       if (shouldExit) {
-        this.closePosition(coinId, sig.price);
+        this.closePosition(coinId, sig.price, 'SIGNAL_REVERSAL');
       }
     }
 
-    // Enter new positions (limit to 5 concurrent)
+    // Enter new positions
     const openCount = Object.keys(this.positions).length;
     const slots = Math.min(5 - openCount, buySignals.length + sellSignals.length);
     if (slots <= 0) return;
@@ -353,35 +441,33 @@ class PaperTrader {
     for (const s of buySignals) {
       if (entered >= slots) break;
       if (this.positions[s.coinId]) continue;
-      this.openPosition(s.coinId, 'LONG', s.price, `Signal: ${s.description || 'BUY signal'}`);
+      this.openPosition(s.coinId, 'LONG', s.price, `Signal: ${s.description || 'BUY signal'}`, s.confidence);
       entered++;
     }
     for (const s of sellSignals) {
       if (entered >= slots) break;
       if (this.positions[s.coinId]) continue;
-      // For short, flip the direction meaning
-      this.openPosition(s.coinId, 'SHORT', s.price, `Signal: ${s.description || 'SELL signal'}`);
+      this.openPosition(s.coinId, 'SHORT', s.price, `Signal: ${s.description || 'SELL signal'}`, s.confidence);
       entered++;
     }
+
+    if (openCount === 0 && entered > 0) this.startPricePolling();
   }
 
-  openPosition(coinId, direction, price, reason) {
+  openPosition(coinId, direction, price, reason, confidence) {
     const alloc = this.balance * this.maxPerPosition;
     const size = alloc / price;
+    const slPrice = direction === 'LONG' ? price * (1 - this.slPct) : price * (1 + this.slPct);
+    const tpPrice = direction === 'LONG' ? price * (1 + this.tpPct) : price * (1 - this.tpPct);
     this.positions[coinId] = {
-      direction,
-      entryPrice: price,
-      size,
-      entryAt: Date.now(),
-      reason,
-      pnl: 0,
-      pnlPct: 0,
+      direction, entryPrice: price, size, entryAt: Date.now(), reason,
+      confidence: confidence || 50,
+      slPrice, tpPrice, pnl: 0, pnlPct: 0,
     };
-    this.balance -= alloc * (direction === 'LONG' ? 1 : 0); // shorts don't cost upfront in paper
-    // Track the allocated balance as a hold
+    this.balance -= alloc * (direction === 'LONG' ? 1 : 0);
   }
 
-  closePosition(coinId, exitPrice) {
+  closePosition(coinId, exitPrice, reason = 'SIGNAL_REVERSAL') {
     const pos = this.positions[coinId];
     if (!pos) return;
 
@@ -391,70 +477,262 @@ class PaperTrader {
     const pnlPct = (pnl / entryVal) * 100;
 
     const trade = {
-      coinId,
-      direction: pos.direction,
-      entryPrice: pos.entryPrice,
-      exitPrice,
-      size: pos.size,
+      coinId, direction: pos.direction,
+      entryPrice: pos.entryPrice, exitPrice, size: pos.size,
       pnl: Math.round(pnl * 100) / 100,
       pnlPct: Math.round(pnlPct * 100) / 100,
       entered: new Date(pos.entryAt).toISOString(),
       exited: new Date().toISOString(),
       reason: pos.reason,
-      duration: Math.round((Date.now() - pos.entryAt) / 1000 / 60), // minutes
+      exitReason: reason,
+      duration: Math.round((Date.now() - pos.entryAt) / 1000 / 60),
     };
     this.trades.push(trade);
-    this.balance += entryVal + pnl; // restore entry + profit
+    this.balance += entryVal + pnl;
+
+    // Record confidence calibration
+    this.recordConfidenceCalibration(pos.confidence, pnl > 0);
+
     delete this.positions[coinId];
+    if (Object.keys(this.positions).length === 0) this.stopPricePolling();
   }
 
   getStatus(signals) {
     const openPositions = Object.entries(this.positions).map(([coinId, pos]) => {
-      const sig = signals.find(s => s.coinId === coinId);
-      const markPrice = sig ? sig.price : pos.entryPrice;
+      // Prefer cached CG price, then signal price, then entry
+      const cached = this.priceCache[coinId];
+      const sig = signals?.find(s => s.coinId === coinId);
+      const markPrice = cached?.price || sig?.price || pos.entryPrice;
+
       const entryVal = pos.size * pos.entryPrice;
       const exitVal = pos.size * markPrice;
       const pnl = pos.direction === 'LONG' ? exitVal - entryVal : entryVal - exitVal;
       const pnlPct = (pnl / entryVal) * 100;
       return {
-        coinId,
-        direction: pos.direction,
-        entryPrice: pos.entryPrice,
-        currentPrice: markPrice,
-        size: pos.size,
+        coinId, direction: pos.direction,
+        entryPrice: pos.entryPrice, currentPrice: markPrice, size: pos.size,
         value: Math.round(entryVal * 100) / 100,
         pnl: Math.round(pnl * 100) / 100,
         pnlPct: Math.round(pnlPct * 100) / 100,
+        slPrice: pos.slPrice, tpPrice: pos.tpPrice,
         duration: Math.round((Date.now() - pos.entryAt) / 1000 / 60),
         reason: pos.reason,
       };
     });
 
-    const closedTrades = [...this.trades].reverse().slice(0, 50);
+    const closedTrades = [...this.trades].reverse().slice(0, 100);
     const wins = this.trades.filter(t => t.pnl > 0).length;
     const losses = this.trades.filter(t => t.pnl < 0).length;
     const totalPnl = this.trades.reduce((s, t) => s + t.pnl, 0);
     const totalInvested = this.trades.reduce((s, t) => s + t.size * t.entryPrice, 0) + openPositions.reduce((s, p) => s + p.value, 0);
     const totalReturn = totalInvested > 0 ? (totalPnl / totalInvested) * 100 : 0;
+    const sharpeNumerator = this.trades.length > 1
+      ? this.trades.reduce((s, t) => s + t.pnlPct, 0) / this.trades.length
+      : 0;
+    const sharpeDenom = this.trades.length > 1
+      ? Math.sqrt(this.trades.reduce((s, t) => s + (t.pnlPct - sharpeNumerator) ** 2, 0) / (this.trades.length - 1))
+      : 1;
+    const sharpeRatio = sharpeDenom > 0 ? sharpeNumerator / sharpeDenom * Math.sqrt(365) : 0;
 
     return {
       balance: Math.round(this.balance * 100) / 100,
       startBalance: this.startBalance,
       equity: Math.round((this.balance + openPositions.reduce((s, p) => s + p.pnl, 0)) * 100) / 100,
       totalTrades: this.trades.length,
-      wins,
-      losses,
+      wins, losses,
       winRate: this.trades.length > 0 ? Math.round((wins / this.trades.length) * 100) : 0,
       totalPnl: Math.round(totalPnl * 100) / 100,
       totalReturn: Math.round(totalReturn * 100) / 100,
+      sharpeRatio: Math.round(sharpeRatio * 100) / 100,
+      avgTradePnl: this.trades.length > 0 ? Math.round((totalPnl / this.trades.length) * 100) / 100 : 0,
+      bestTrade: this.trades.length > 0 ? Math.round(Math.max(...this.trades.map(t => t.pnlPct)) * 100) / 100 : 0,
+      worstTrade: this.trades.length > 0 ? Math.round(Math.min(...this.trades.map(t => t.pnlPct)) * 100) / 100 : 0,
+      avgDuration: this.trades.length > 0 ? Math.round(this.trades.reduce((s, t) => s + t.duration, 0) / this.trades.length) : 0,
       openPositions,
-      recentTrades: closedTrades.slice(0, 20),
+      recentTrades: closedTrades.slice(0, 30),
+      confidenceCalibration: this.getConfidenceCalibration(),
       lastUpdated: new Date().toISOString(),
     };
   }
 }
 
 const trader = new PaperTrader();
+
+/* ─────────────────────────────────────────────
+   BACKTEST ENGINE — replay last 30 days
+   ───────────────────────────────────────────── */
+let backtestCache = null;
+
+async function getOHLC(days = 30) {
+  const cacheKey = `bt_${days}`;
+  if (backtestCache?.key === cacheKey && (Date.now() - backtestCache.fetched) < 3600_000) {
+    return backtestCache.data;
+  }
+  // Fetch 30-day hourly prices for all coins
+  const result = {};
+  const batchSize = 6; // CoinGecko allows ~10-15/min free tier
+  const batches = [];
+  for (let i = 0; i < COINS.length; i += batchSize) {
+    batches.push(COINS.slice(i, i + batchSize));
+  }
+
+  let fetched = 0;
+  for (const batch of batches) {
+    await Promise.all(batch.map(async (coin) => {
+      try {
+        const res = await fetchWithTimeout(
+          `https://api.coingecko.com/api/v3/coins/${coin.id}/market_chart?vs_currency=usd&days=${days}`,
+          12000
+        );
+        if (!res.ok) {
+          console.log(`  ⚠️ Backtest ${coin.id}: HTTP ${res.status}`);
+          return;
+        }
+        const data = await res.json();
+        const prices = (data.prices || []).map(p => p[1]);
+        if (prices.length > 50) {
+          result[coin.id] = prices;
+          fetched++;
+        }
+      } catch (e) {
+        console.log(`  ⚠️ Backtest ${coin.id}: ${e.message}`);
+      }
+    }));
+    // Rate limit: wait 2s between batches
+    if (batches.length > 1) await new Promise(r => setTimeout(r, 2000));
+  }
+
+  backtestCache = { key: cacheKey, data: result, fetched: Date.now() };
+  console.log(`📊 Backtest: ${fetched}/${COINS.length} coins, ${days}d`);
+  return result;
+}
+
+// Replay signals across historical data
+function runBacktest(ohlc, coinIds = null) {
+  const coinsToTest = coinIds || COINS.map(c => c.id);
+  const results = {};
+
+  for (const coinId of coinsToTest) {
+    const prices = ohlc[coinId];
+    if (!prices || prices.length < 100) continue;
+
+    const coin = COINS.find(c => c.id === coinId);
+    const trader = new PaperTrader();
+
+    // Slide a 200-point window (≈8 days of hourly data) and generate signals
+    // every 24 periods (≈ every day)
+    const WINDOW = 200;
+    const STEP = 24; // check every day
+    let totalBuys = 0, totalSells = 0, winBuys = 0, winSells = 0;
+    let buyPnl = 0, sellPnl = 0;
+
+    for (let start = 0; start + WINDOW + 24 < prices.length; start += STEP) {
+      const windowPrices = prices.slice(start, start + WINDOW);
+      const lookahead = prices.slice(start + WINDOW, start + WINDOW + 24); // 24h forward
+
+      // Compute indicators on window
+      const currentPrice = windowPrices[windowPrices.length - 1];
+      const rsiVal = rsi(windowPrices);
+      const ema8 = ema(windowPrices, 8);
+      const ema21 = ema(windowPrices, 21);
+      const bollinger = bb(windowPrices);
+      const bbPos = (currentPrice - bollinger.lower) / (bollinger.upper - bollinger.lower || 1);
+      const m = macd(windowPrices);
+      const emaRatio = ema8 / ema21;
+
+      // Score it (simplified — same logic as computeSignal)
+      let score = 0;
+      const windowStart = windowPrices[0];
+      const trendStrength = windowPrices.length > 168
+        ? ((currentPrice - windowPrices[windowPrices.length - 169]) / windowPrices[windowPrices.length - 169]) * 100
+        : 0;
+      const trendBull = trendStrength > 10 || emaRatio > 1.02 ? 0.5 : 1.0;
+      const trendBear = trendStrength < -8 || emaRatio < 0.98 ? 0.5 : 1.0;
+
+      if (rsiVal < 30) score += Math.round(4 * trendBull);
+      else if (rsiVal < 38) score += Math.round(2 * trendBull);
+      else if (rsiVal > 78) score += Math.round(-3 * trendBear);
+      else if (rsiVal > 68) score += Math.round(-1 * trendBear);
+
+      if (emaRatio > 1.025) score += 3;
+      else if (emaRatio > 1.008) score += 1;
+      else if (emaRatio < 0.975) score -= 3;
+      else if (emaRatio < 0.992) score -= 1;
+
+      if (bbPos < 0.05) score += 3;
+      else if (bbPos < 0.2) score += 1;
+      else if (bbPos > 0.95) score -= 2;
+      else if (bbPos > 0.85) score -= 1;
+
+      if (m.line > 0) score += 2;
+      else if (m.line < 0) score -= 2;
+
+      // Get the forward price change over next 24h
+      const forwardPrice = lookahead[lookahead.length - 1] || currentPrice;
+      const forwardChange = ((forwardPrice - currentPrice) / currentPrice) * 100;
+
+      let direction;
+      if (score >= 4) direction = 'STRONG_BUY';
+      else if (score >= 1) direction = 'BUY';
+      else if (score <= -4) direction = 'STRONG_SELL';
+      else if (score <= -1) direction = 'SELL';
+      else direction = 'HOLD';
+
+      if (direction === 'BUY' || direction === 'STRONG_BUY') {
+        totalBuys++;
+        // Check SL/TP over the next 24h
+        let tradePnl = forwardChange;
+        // Simulate SL: if at any point -5% intraday, SL hits
+        // Simulate TP: if +12% at any point, TP hits
+        for (const p of lookahead) {
+          const chg = ((p - currentPrice) / currentPrice) * 100;
+          if (chg <= -5) { tradePnl = -5; break; }
+          if (chg >= 12) { tradePnl = 12; break; }
+        }
+        if (tradePnl > 0) winBuys++;
+        buyPnl += tradePnl;
+      } else if (direction === 'SELL' || direction === 'STRONG_SELL') {
+        totalSells++;
+        let tradePnl = -forwardChange; // short pnl
+        for (const p of lookahead) {
+          const chg = ((currentPrice - p) / currentPrice) * 100;
+          if (chg <= -5) { tradePnl = -5; break; }
+          if (chg >= 12) { tradePnl = 12; break; }
+        }
+        if (tradePnl > 0) winSells++; else if (tradePnl < 0) {}
+        sellPnl += tradePnl;
+      }
+    }
+
+    results[coinId] = {
+      symbol: coin?.sym || coinId,
+      name: coin?.name || coinId,
+      totalSignals: totalBuys + totalSells,
+      buys: totalBuys, buyWinRate: totalBuys > 0 ? Math.round((winBuys / totalBuys) * 100) : 0,
+      sells: totalSells, sellWinRate: totalSells > 0 ? Math.round((winSells / totalSells) * 100) : 0,
+      avgBuyPnl: totalBuys > 0 ? Math.round((buyPnl / totalBuys) * 10) / 10 : 0,
+      avgSellPnl: totalSells > 0 ? Math.round((sellPnl / totalSells) * 10) / 10 : 0,
+      totalBuyPnl: Math.round(buyPnl * 10) / 10,
+      totalSellPnl: Math.round(sellPnl * 10) / 10,
+      netPnl: Math.round((buyPnl + sellPnl) * 10) / 10,
+    };
+  }
+
+  const coins = Object.values(results);
+  const trades = coins.reduce((s, c) => s + c.totalSignals, 0);
+  const wins = coins.reduce((s, c) => s + Math.round(c.buys * c.buyWinRate / 100) + Math.round(c.sells * c.sellWinRate / 100), 0);
+
+  return {
+    generatedAt: new Date().toISOString(),
+    totalSignals: trades,
+    overallWinRate: trades > 0 ? Math.round((wins / trades) * 100) : 0,
+    totalNetPnl: Math.round(coins.reduce((s, c) => s + c.netPnl, 0) * 10) / 10,
+    avgBuyWinRate: Math.round(coins.filter(c => c.buys > 0).reduce((s, c) => s + c.buyWinRate, 0) / Math.max(1, coins.filter(c => c.buys > 0).length)),
+    avgSellWinRate: Math.round(coins.filter(c => c.sells > 0).reduce((s, c) => s + c.sellWinRate, 0) / Math.max(1, coins.filter(c => c.sells > 0).length)),
+    avgNetPnlPerCoin: coins.length > 0 ? Math.round(coins.reduce((s, c) => s + c.netPnl, 0) / coins.length * 10) / 10 : 0,
+    coins: Object.values(results).sort((a, b) => b.netPnl - a.netPnl),
+  };
+}
 
 /* ─────────────────────────────────────────────
    WARM UP HERMES
@@ -587,6 +865,19 @@ app.get('/api/overview', async (req, res) => {
     // Don't trigger paper trading on overview-only requests
     res.json({ success: true, overview: marketOverview(signals) });
   } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+/* GET /api/backtest — run backtest over last 30 days */
+app.get('/api/backtest', async (req, res) => {
+  try {
+    const days = Math.min(60, Math.max(7, parseInt(req.query.days) || 30));
+    const ohlc = await getOHLC(days);
+    const result = runBacktest(ohlc);
+    res.json({ success: true, ...result });
+  } catch (e) {
+    console.error('Backtest error:', e.message);
     res.status(500).json({ success: false, error: e.message });
   }
 });

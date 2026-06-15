@@ -7,8 +7,58 @@ import { spawnSync } from 'child_process';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
-app.use(cors());
+app.use(cors({
+  origin: true,
+  methods: ['GET', 'POST'],
+  maxAge: 86400,
+}));
 app.use(express.json());
+
+/* ─────────────────────────────────────────────
+   STARTUP TIME — for health check uptime
+   ───────────────────────────────────────────── */
+const START_TIME = Date.now();
+
+/* ─────────────────────────────────────────────
+   GLOBAL ERROR HANDLING — never crash silently
+   ───────────────────────────────────────────── */
+process.on('uncaughtException', (err) => {
+  console.error('💥 UNCAUGHT EXCEPTION:', err.message);
+  console.error(err.stack?.substring(0, 500));
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('💥 UNHANDLED REJECTION:', reason?.message || reason);
+});
+
+/* ─────────────────────────────────────────────
+   HELPER: fetch with retry + backoff
+   ───────────────────────────────────────────── */
+async function fetchWithRetry(url, options = {}, retries = 2) {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const ctrl = new AbortController();
+      const id = setTimeout(() => ctrl.abort(), options.timeout || 15000);
+      const res = await fetch(url, { ...options, signal: ctrl.signal });
+      clearTimeout(id);
+      if (res.status === 429 && attempt < retries) {
+        const wait = (attempt + 1) * 2000;
+        console.log(`⏳ Rate limited, retry ${attempt + 1}/${retries} in ${wait}ms`);
+        await new Promise(r => setTimeout(r, wait));
+        continue;
+      }
+      return res;
+    } catch (e) {
+      if (attempt === retries) throw e;
+      const wait = (attempt + 1) * 1500;
+      console.log(`⏳ Fetch failed (${e.message}), retry ${attempt + 1}/${retries} in ${wait}ms`);
+      await new Promise(r => setTimeout(r, wait));
+    }
+  }
+}
+
+async function fetchWithTimeout(url, ms = 15000) {
+  return fetchWithRetry(url, { timeout: ms }, 2);
+}
 
 /* ─────────────────────────────────────────────
    COIN LIST — 18 top cryptos
@@ -85,19 +135,6 @@ function macd(values) {
 let cachedMarket = null;
 let lastMarketFetch = 0;
 const MARKET_TTL = 10 * 60 * 1000;
-
-async function fetchWithTimeout(url, ms = 15000) {
-  const ctrl = new AbortController();
-  const id = setTimeout(() => ctrl.abort(), ms);
-  try {
-    const res = await fetch(url, { signal: ctrl.signal });
-    clearTimeout(id);
-    return res;
-  } catch (e) {
-    clearTimeout(id);
-    throw e;
-  }
-}
 
 async function fetchMarketData() {
   const now = Date.now();
@@ -895,6 +932,30 @@ function marketOverview(allSignals) {
 /* ─────────────────────────────────────────────
    API ROUTES
    ───────────────────────────────────────────── */
+
+/* GET /api/health — production health check */
+app.get('/api/health', (req, res) => {
+  const uptime = Math.floor((Date.now() - START_TIME) / 1000);
+  const uptimeStr = uptime < 60 ? `${uptime}s`
+    : uptime < 3600 ? `${Math.floor(uptime / 60)}m ${uptime % 60}s`
+    : `${Math.floor(uptime / 3600)}h ${Math.floor((uptime % 3600) / 60)}m`;
+  res.json({
+    status: 'ok',
+    version: 2,
+    uptime: uptimeStr,
+    uptimeSeconds: uptime,
+    started: new Date(START_TIME).toISOString(),
+    coins: COINS.length,
+    cacheAge: lastMarketFetch > 0 ? Math.round((Date.now() - lastMarketFetch) / 1000) + 's' : 'none',
+    cacheFresh: (Date.now() - lastMarketFetch) < MARKET_TTL,
+    memory: process.memoryUsage().rss > 1e9
+      ? (process.memoryUsage().rss / 1e9).toFixed(2) + 'GB'
+      : (process.memoryUsage().rss / 1e6).toFixed(0) + 'MB',
+    paperTrades: trader.trades.length,
+    openPositions: Object.keys(trader.positions).length,
+    timestamp: new Date().toISOString(),
+  });
+});
 
 /* GET /api/signals — main endpoint */
 app.get('/api/signals', async (req, res) => {

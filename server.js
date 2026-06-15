@@ -268,6 +268,22 @@ function computeSignal(coin, md) {
     confidence: Math.round(confidence),
     reasons: reasons.slice(0, 4),
     description: reasons.slice(0, 2).join('. '),
+    // Entry guidance: for BUY, limit slightly below or at market; for SELL, limit above
+    entryPrice: direction === 'BUY' || direction === 'STRONG_BUY'
+      ? Math.round(price * (1 - 0.002) * 100) / 100  // 0.2% below for limit buy
+      : direction === 'SELL' || direction === 'STRONG_SELL'
+        ? Math.round(price * (1 + 0.002) * 100) / 100 // 0.2% above for limit sell
+        : null,
+    stopLoss: direction === 'BUY' || direction === 'STRONG_BUY'
+      ? Math.round(price * 0.95 * 100) / 100  // 5% below
+      : direction === 'SELL' || direction === 'STRONG_SELL'
+        ? Math.round(price * 1.05 * 100) / 100  // 5% above (for short)
+        : null,
+    takeProfit: direction === 'BUY' || direction === 'STRONG_BUY'
+      ? Math.round(price * 1.12 * 100) / 100  // 12% above
+      : direction === 'SELL' || direction === 'STRONG_SELL'
+        ? Math.round(price * 0.88 * 100) / 100  // 12% below (for short)
+        : null,
     timestamp: new Date().toISOString(),
   };
 }

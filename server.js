@@ -559,6 +559,65 @@ class PaperTrader {
 const trader = new PaperTrader();
 
 /* ─────────────────────────────────────────────
+   SIGNAL HISTORY — log every signal generation
+   ───────────────────────────────────────────── */
+class SignalHistory {
+  constructor() {
+    this.entries = [];
+    this.maxEntries = 500;
+  }
+
+  record(signals, overview, timestamp) {
+    const snapshot = {
+      timestamp: timestamp || new Date().toISOString(),
+      overview: { ...overview },
+      signals: signals.map(s => ({
+        coinId: s.coinId, symbol: s.symbol, direction: s.direction,
+        confidence: s.confidence, score: s.score, price: s.price,
+        rsi: s.rsi,
+      })),
+    };
+    this.entries.push(snapshot);
+    if (this.entries.length > this.maxEntries) {
+      this.entries = this.entries.slice(-this.maxEntries);
+    }
+  }
+
+  getTimeline(limit = 30) {
+    return [...this.entries].reverse().slice(0, limit);
+  }
+
+  getPerformance() {
+    // For each coin, count how many times it was BUY vs SELL vs HOLD
+    const coinStats = {};
+    for (const entry of this.entries) {
+      for (const s of entry.signals) {
+        if (!coinStats[s.coinId]) {
+          coinStats[s.coinId] = { symbol: s.symbol, buys: 0, sells: 0, holds: 0, total: 0, avgConf: 0, confSum: 0 };
+        }
+        const cs = coinStats[s.coinId];
+        cs.total++;
+        cs.confSum += s.confidence;
+        if (s.direction === 'BUY' || s.direction === 'STRONG_BUY') cs.buys++;
+        else if (s.direction === 'SELL' || s.direction === 'STRONG_SELL') cs.sells++;
+        else cs.holds++;
+      }
+    }
+    for (const cs of Object.values(coinStats)) {
+      cs.avgConf = cs.total > 0 ? Math.round(cs.confSum / cs.total) : 0;
+    }
+    return {
+      totalEntries: this.entries.length,
+      firstEntry: this.entries.length > 0 ? this.entries[0].timestamp : null,
+      lastEntry: this.entries.length > 0 ? this.entries[this.entries.length - 1].timestamp : null,
+      coins: Object.values(coinStats).sort((a, b) => b.total - a.total),
+    };
+  }
+}
+
+const signalHistory = new SignalHistory();
+
+/* ─────────────────────────────────────────────
    BACKTEST ENGINE — replay last 30 days
    ───────────────────────────────────────────── */
 let backtestCache = null;
@@ -568,42 +627,50 @@ async function getOHLC(days = 30) {
   if (backtestCache?.key === cacheKey && (Date.now() - backtestCache.fetched) < 3600_000) {
     return backtestCache.data;
   }
-  // Fetch 30-day hourly prices for all coins
+  // Use the existing market data sparklines (168 pts = 7 days hourly)
+  // For >7 days, fetch market data for each past day range
   const result = {};
-  const batchSize = 6; // CoinGecko allows ~10-15/min free tier
-  const batches = [];
-  for (let i = 0; i < COINS.length; i += batchSize) {
-    batches.push(COINS.slice(i, i + batchSize));
+  let fetched = 0;
+
+  // First, get today's sparkline from the existing market endpoint (always succeeds)
+  const marketData = await fetchMarketData();
+  if (marketData) {
+    for (const coin of COINS) {
+      const md = marketData[coin.id];
+      if (md?.sparkline?.length >= 50) {
+        result[coin.id] = md.sparkline;
+        fetched++;
+      }
+    }
   }
 
-  let fetched = 0;
-  for (const batch of batches) {
-    await Promise.all(batch.map(async (coin) => {
+  // For longer backtests, try to get additional history
+  if (days > 7) {
+    const extraDays = Math.min(days, 30);
+    // Try fetching a few more days individually
+    const topCoins = COINS.slice(0, 6); // limit to avoid rate limits
+    for (const coin of topCoins) {
+      if (result[coin.id] && result[coin.id].length >= 168) continue; // already have 7d
       try {
         const res = await fetchWithTimeout(
-          `https://api.coingecko.com/api/v3/coins/${coin.id}/market_chart?vs_currency=usd&days=${days}`,
+          `https://api.coingecko.com/api/v3/coins/${coin.id}/market_chart?vs_currency=usd&days=${extraDays}`,
           12000
         );
-        if (!res.ok) {
-          console.log(`  ⚠️ Backtest ${coin.id}: HTTP ${res.status}`);
-          return;
+        if (res.ok) {
+          const data = await res.json();
+          const prices = (data.prices || []).map(p => p[1]);
+          if (prices.length > 50) {
+            result[coin.id] = prices;
+            fetched++;
+          }
         }
-        const data = await res.json();
-        const prices = (data.prices || []).map(p => p[1]);
-        if (prices.length > 50) {
-          result[coin.id] = prices;
-          fetched++;
-        }
-      } catch (e) {
-        console.log(`  ⚠️ Backtest ${coin.id}: ${e.message}`);
-      }
-    }));
-    // Rate limit: wait 2s between batches
-    if (batches.length > 1) await new Promise(r => setTimeout(r, 2000));
+        await new Promise(r => setTimeout(r, 2000));
+      } catch (_) {}
+    }
   }
 
   backtestCache = { key: cacheKey, data: result, fetched: Date.now() };
-  console.log(`📊 Backtest: ${fetched}/${COINS.length} coins, ${days}d`);
+  console.log(`📊 Backtest: ${Object.keys(result).length}/${COINS.length} coins, ${days}d`);
   return result;
 }
 
@@ -619,16 +686,15 @@ function runBacktest(ohlc, coinIds = null) {
     const coin = COINS.find(c => c.id === coinId);
     const trader = new PaperTrader();
 
-    // Slide a 200-point window (≈8 days of hourly data) and generate signals
-    // every 24 periods (≈ every day)
-    const WINDOW = 200;
-    const STEP = 24; // check every day
+    // Slide a 50-point window and generate signals every 6 periods
+    const WINDOW = 50;
+    const STEP = 6;
     let totalBuys = 0, totalSells = 0, winBuys = 0, winSells = 0;
     let buyPnl = 0, sellPnl = 0;
 
-    for (let start = 0; start + WINDOW + 24 < prices.length; start += STEP) {
+    for (let start = 0; start + WINDOW + 12 < prices.length; start += STEP) {
       const windowPrices = prices.slice(start, start + WINDOW);
-      const lookahead = prices.slice(start + WINDOW, start + WINDOW + 24); // 24h forward
+      const lookahead = prices.slice(start + WINDOW, start + WINDOW + 12); // 12h forward
 
       // Compute indicators on window
       const currentPrice = windowPrices[windowPrices.length - 1];
@@ -672,9 +738,9 @@ function runBacktest(ohlc, coinIds = null) {
       const forwardChange = ((forwardPrice - currentPrice) / currentPrice) * 100;
 
       let direction;
-      if (score >= 4) direction = 'STRONG_BUY';
+      if (score >= 3) direction = 'STRONG_BUY';
       else if (score >= 1) direction = 'BUY';
-      else if (score <= -4) direction = 'STRONG_SELL';
+      else if (score <= -3) direction = 'STRONG_SELL';
       else if (score <= -1) direction = 'SELL';
       else direction = 'HOLD';
 
@@ -805,6 +871,9 @@ app.get('/api/signals', async (req, res) => {
     const overview = marketOverview(signals);
     const portfolio = trader.getStatus(signals);
 
+    // Record signal history
+    signalHistory.record(signals, overview);
+
     signals.sort((a, b) => b.confidence - a.confidence);
 
     res.json({
@@ -867,6 +936,16 @@ app.get('/api/overview', async (req, res) => {
   } catch (e) {
     res.status(500).json({ success: false, error: e.message });
   }
+});
+
+/* GET /api/history — signal timeline */
+app.get('/api/history', (req, res) => {
+  const limit = Math.min(100, parseInt(req.query.limit) || 20);
+  res.json({
+    success: true,
+    timeline: signalHistory.getTimeline(limit),
+    performance: signalHistory.getPerformance(),
+  });
 });
 
 /* GET /api/backtest — run backtest over last 30 days */
@@ -963,4 +1042,10 @@ app.get('{*path}', (req, res) => {
 const PORT = process.env.PORT || 5151;
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Crypto Signals on :${PORT} (${COINS.length} coins, CoinGecko live)`);
+  // Pre-warm backtest data in background
+  setTimeout(async () => {
+    console.log('📊 Pre-warming backtest data...');
+    await getOHLC(30);
+    console.log('📊 Backtest data ready');
+  }, 5000);
 });

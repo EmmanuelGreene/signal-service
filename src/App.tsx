@@ -209,8 +209,8 @@ function SignalCard({ s }: { s: Signal }) {
 
 /* ─── Top Picks ─── */
 function TopPicks({ signals, backtest }: { signals: Signal[], backtest: BacktestResult | null }) {
-  const buys = signals.filter(s => s.direction === 'STRONG_BUY' || s.direction === 'BUY').sort((a, b) => b.confidence - a.confidence).slice(0, 2);
-  const sells = signals.filter(s => s.direction === 'STRONG_SELL' || s.direction === 'SELL').sort((a, b) => b.confidence - a.confidence).slice(0, 1);
+  const buys = signals.filter(s => s.direction === 'STRONG_BUY').sort((a, b) => b.confidence - a.confidence).slice(0, 2);
+  const sells = signals.filter(s => s.direction === 'STRONG_SELL').sort((a, b) => b.confidence - a.confidence).slice(0, 1);
 
   if (buys.length === 0 && sells.length === 0) return null;
 

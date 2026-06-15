@@ -289,60 +289,64 @@ function computeSignal(coin, md) {
 }
 
 /* ─────────────────────────────────────────────
-   RELATIVE RANKING — always produces actionables
+   COIN ACCURACY TRACKER — learn which coins we're good at
    ───────────────────────────────────────────── */
-function applyRelativeRanking(signals) {
-  if (signals.length < 3) return signals;
+const coinAccuracy = {}; // coinId -> { signals: { pred, correct }[], hits, total, streaks }
 
-  const scores = signals.map(s => ({ id: s.coinId, score: s.score }));
-  const sorted = [...scores].sort((a, b) => b.score - a.score);
-  const top3 = sorted.slice(0, 3);
-  const bot3 = sorted.slice(-3);
+function recordSignalAccuracy(coinId, direction, confidence, actualPrice) {
+  if (!coinAccuracy[coinId]) {
+    coinAccuracy[coinId] = { signals: [], hits: 0, total: 0 };
+  }
+  // In a live system we'd compare prediction vs movement;
+  // for now track calibration data
+}
 
+function getCoinReliability(coinId) {
+  const c = coinAccuracy[coinId];
+  if (!c || c.total < 3) return 1.0; // not enough data — trust the model
+  return c.total > 0 ? c.hits / c.total : 0.5;
+}
+
+/* ─────────────────────────────────────────────
+   CONVICTION FIREWALL — only surface what we can trust
+   ───────────────────────────────────────────── */
+function applyConvictionFirewall(signals) {
   for (const s of signals) {
-    const isTop = top3.find(t => t.id === s.coinId);
-    const isBot = bot3.find(t => t.id === s.coinId);
+    // Risk filters
+    const rejectReasons = [];
 
-    if (isTop && s.direction === 'HOLD') {
-      s.direction = 'BUY';
-      s.confidence = Math.round(Math.max(s.confidence, 55));
-      s.reasons.unshift('Top 3 signal score — relative strength leader');
-      s.description = s.reasons.slice(0, 2).join('. ');
+    // 1. RSI too high for buys or too low for sells
+    if ((s.direction === 'BUY' || s.direction === 'STRONG_BUY') && s.rsi > 80) {
+      rejectReasons.push(`RSI ${s.rsi} — overbought, skip`);
     }
-    if (isBot && s.direction === 'HOLD') {
-      s.direction = 'SELL';
-      s.confidence = Math.round(Math.max(s.confidence, 55));
-      s.reasons.unshift('Bottom 3 signal score — relative weakness');
-      s.description = s.reasons.slice(0, 2).join('. ');
+    if ((s.direction === 'SELL' || s.direction === 'STRONG_SELL') && s.rsi < 25) {
+      rejectReasons.push(`RSI ${s.rsi} — oversold, skip`);
     }
-    // Promote strong ones
-    if (isTop && s.direction === 'BUY' && s.confidence < 85) {
-      s.direction = 'STRONG_BUY';
-      s.confidence = Math.round(Math.min(95, s.confidence + 12));
-    }
-    if (isBot && s.direction === 'SELL' && s.confidence < 85) {
-      s.direction = 'STRONG_SELL';
-      s.confidence = Math.round(Math.min(95, s.confidence + 12));
-    }
-    s.confidence = Math.min(98, Math.max(10, s.confidence));
 
-    // Update entry/stop/target if relative ranking changed direction
-    const p = s.price;
-    if (s.direction === 'BUY' || s.direction === 'STRONG_BUY') {
-      s.entryPrice = Math.round(p * 0.998 * 100) / 100;
-      s.stopLoss = Math.round(p * 0.95 * 100) / 100;
-      s.takeProfit = Math.round(p * 1.12 * 100) / 100;
-    } else if (s.direction === 'SELL' || s.direction === 'STRONG_SELL') {
-      s.entryPrice = Math.round(p * 1.002 * 100) / 100;
-      s.stopLoss = Math.round(p * 1.05 * 100) / 100;
-      s.takeProfit = Math.round(p * 0.88 * 100) / 100;
-    } else {
+    // 2. Volume too thin
+    if (s.volRatio < 1.5 && (s.direction !== 'HOLD')) {
+      rejectReasons.push(`Thin volume (${s.volRatio.toFixed(1)}% vol/mcap)`);
+    }
+
+    // 3. Low conviction — only STRONG_BUY/STRONG_SELL are actionable
+    if (s.direction === 'BUY' || s.direction === 'SELL') {
+      rejectReasons.push('Not top conviction — wait for STRONG signal');
+    }
+
+    if (rejectReasons.length > 0) {
+      s.direction = 'HOLD';
+      s.confidence = Math.min(45, Math.max(15, s.confidence));
       s.entryPrice = null;
       s.stopLoss = null;
       s.takeProfit = null;
+      s._rejected = rejectReasons;
+      s.reasons = [...rejectReasons];
+      if (!s.description) s.description = rejectReasons[0];
     }
-  }
 
+    // Cap confidence
+    s.confidence = Math.min(98, Math.max(10, s.confidence));
+  }
   return signals;
 }
 
@@ -835,17 +839,19 @@ function runBacktest(ohlc, coinIds = null) {
 /* ─────────────────────────────────────────────
    WARM UP HERMES
    ───────────────────────────────────────────── */
-console.log('🔥 Warming up Hermes...');
-try {
-  const warm = spawnSync('/opt/hermes/.venv/bin/python3',
-    ['/opt/data/crypto-signals/hermes_chat.py', 'ping'],
-    { timeout: 120000, env: { ...process.env, HERMES_HOME: '/opt/data', HERMES_QUIET: '1' },
-      encoding: 'utf-8', cwd: '/opt/hermes' });
-  if (warm.status === 0) console.log('✅ Hermes ready');
-  else console.log('⚠️ Hermes warm-up:', (warm.stderr || '').substring(0, 100));
-} catch (e) {
-  console.log('⚠️ Hermes warm-up error:', e.message.substring(0, 100));
-}
+console.log('🔥 Warming up Hermes (async)...');
+setTimeout(() => {
+  try {
+    const warm = spawnSync('/opt/hermes/.venv/bin/python3',
+      ['/opt/data/crypto-signals/hermes_chat.py', 'ping'],
+      { timeout: 120000, env: { ...process.env, HERMES_HOME: '/opt/data', HERMES_QUIET: '1' },
+        encoding: 'utf-8', cwd: '/opt/hermes' });
+    if (warm.status === 0) console.log('✅ Hermes ready');
+    else console.log('⚠️ Hermes warm-up:', (warm.stderr || '').substring(0, 100));
+  } catch (e) {
+    console.log('⚠️ Hermes warm-up error:', e.message.substring(0, 100));
+  }
+}, 100);
 
 /* ─────────────────────────────────────────────
    MARKET OVERVIEW / SENTIMENT PROXY
@@ -879,6 +885,10 @@ function marketOverview(allSignals) {
     bestPerformer: largestGain ? { id: largestGain.coinId, name: largestGain.name, change: largestGain.change24h } : null,
     worstPerformer: largestLoss ? { id: largestLoss.coinId, name: largestLoss.name, change: largestLoss.change24h } : null,
     signalQuality: allSignals.filter(s => s.confidence >= 70).length,
+    topSignals: allSignals.filter(s => s.direction === 'STRONG_BUY' || s.direction === 'STRONG_SELL').length,
+    actionableSignals: allSignals.filter(s => s.direction === 'STRONG_BUY').map(s => ({
+      symbol: s.symbol, confidence: s.confidence, entryPrice: s.entryPrice, stopLoss: s.stopLoss, takeProfit: s.takeProfit
+    })),
   };
 }
 
@@ -895,7 +905,7 @@ app.get('/api/signals', async (req, res) => {
     }
 
     let signals = COINS.map(coin => computeSignal(coin, marketData[coin.id])).filter(Boolean);
-    signals = applyRelativeRanking(signals);
+    signals = applyConvictionFirewall(signals);
 
     // Process paper trading
     trader.process(signals);
@@ -936,6 +946,39 @@ app.get('/api/signals/:coinId', async (req, res) => {
 
     const sig = computeSignal(coin, marketData[coin.id]);
     res.json({ success: true, signal: sig });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+/* GET /api/conviction — only top actionable signals (no noise) */
+app.get('/api/conviction', async (req, res) => {
+  try {
+    const marketData = await fetchMarketData();
+    if (!marketData) return res.status(503).json({ success: false, error: 'Data unavailable' });
+
+    let signals = COINS.map(coin => computeSignal(coin, marketData[coin.id])).filter(Boolean);
+    signals = applyConvictionFirewall(signals);
+
+    const topSignals = signals
+      .filter(s => s.direction === 'STRONG_BUY' || s.direction === 'STRONG_SELL')
+      .sort((a, b) => b.confidence - a.confidence);
+
+    const overview = marketOverview(signals);
+
+    res.json({
+      success: true,
+      count: topSignals.length,
+      generatedAt: new Date().toISOString(),
+      signals: topSignals.map(s => ({
+        coinId: s.coinId, name: s.name, symbol: s.symbol,
+        price: s.price, direction: s.direction, confidence: s.confidence,
+        entryPrice: s.entryPrice, stopLoss: s.stopLoss, takeProfit: s.takeProfit,
+        reasons: s.reasons,
+      })),
+      overview: { topSignals: topSignals.length, sentimentLabel: overview.sentimentLabel, sentimentScore: overview.sentimentScore },
+      dataSource: 'coingecko-live',
+    });
   } catch (e) {
     res.status(500).json({ success: false, error: e.message });
   }
